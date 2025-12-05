@@ -152,11 +152,49 @@ Relación entre títulos de Netflix y su equivalente en IMDb mediante fuzzy matc
 
 El diagrama completo se encuentra en el archivo:
 
-✔ **`netflix_full_erd.mmd`** (formato Mermaid)
+erDiagram
 
-Puedes visualizarlo en:
-- https://mermaid.live/
-- VSCode con extensión Mermaid Preview
+    netflix_titles ||--o{ title_genres : "tiene"
+    genres ||--o{ title_genres : "asigna"
+
+    netflix_titles ||--o{ title_actors : "incluye"
+    actors ||--o{ title_actors : "participa"
+
+    netflix_titles {
+        VARCHAR(64) show_id PK
+        VARCHAR type
+        TEXT title
+        TEXT director
+        TEXT cast
+        VARCHAR country
+        DATE date_added
+        INT release_year
+        VARCHAR rating
+        VARCHAR duration_raw
+        INT duration_int
+        VARCHAR duration_unit
+        TEXT description
+    }
+
+    genres {
+        INT genre_id PK
+        VARCHAR genre_name
+    }
+
+    title_genres {
+        VARCHAR show_id FK
+        INT genre_id FK
+    }
+
+    actors {
+        INT actor_id PK
+        VARCHAR actor_name
+    }
+
+    title_actors {
+        VARCHAR show_id FK
+        INT actor_id FK
+    }
 
 ---
 
