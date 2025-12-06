@@ -1,123 +1,66 @@
 #!/usr/bin/env python3
 """
-etl/generate_actor_inserts.py
+etl/dedupe_inserts_actors.py
 
-Genera data/normalized/inserts_actors.sql con INSERTs para:
- - actors (actor_id, actor_name)
- - title_actors (show_id, actor_id)
-
-Funcionamiento:
- - Lee data/normalized/actors.csv (columna actor_name) si existe.
- - Si no existe, lee data/normalized/title_actors_raw.csv y extrae los actores únicos.
- - Asigna actor_id = 1..N en orden alfabético (estable y reproducible).
- - Genera INSERTs SQL seguros escapando comillas simples.
-
-Salida:
- - data/normalized/inserts_actors.sql
+Lee data/normalized/inserts_actors.sql y genera data/normalized/inserts_actors_dedup.sql
+- Mantiene la primera aparición de cada actor_name
+- Emite INSERT IGNORE INTO actors (actor_name) VALUES ('...') para cada actor único
+- Conserva el bloque de title_actors tal cual (no toca esas líneas)
 """
 
-import os
-import csv
-import pandas as pd
+import re
+from pathlib import Path
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_DIR = os.path.join(ROOT, "data", "normalized")
-ACTORS_CSV = os.path.join(DATA_DIR, "actors.csv")
-TITLE_ACTORS_RAW_CSV = os.path.join(DATA_DIR, "title_actors_raw.csv")
-OUT_SQL = os.path.join(DATA_DIR, "inserts_actors.sql")
+ROOT = Path.cwd()
+IN_FILE = ROOT / "data" / "normalized" / "inserts_actors.sql"
+OUT_FILE = ROOT / "data" / "normalized" / "inserts_actors_dedup.sql"
 
-def load_actors():
-    if os.path.exists(ACTORS_CSV):
-        df = pd.read_csv(ACTORS_CSV, dtype=str, keep_default_na=False)
-        # soportar archivos con header 'actor_name' o sin header
-        if 'actor_name' in df.columns:
-            actors = [str(x).strip() for x in df['actor_name'].tolist() if str(x).strip()]
-        else:
-            # si no hay header asumimos primera columna
-            actors = [str(x).strip() for x in df.iloc[:,0].tolist() if str(x).strip()]
-        return sorted(set(actors))
-    # fallback: extraer de title_actors_raw.csv
-    if os.path.exists(TITLE_ACTORS_RAW_CSV):
-        df = pd.read_csv(TITLE_ACTORS_RAW_CSV, dtype=str, keep_default_na=False)
-        # columna actor_name o segunda columna
-        if 'actor_name' in df.columns:
-            actors = [str(x).strip() for x in df['actor_name'].tolist() if str(x).strip()]
-        else:
-            actors = [str(x).strip() for x in df.iloc[:,1].tolist() if str(x).strip()]
-        return sorted(set(actors))
-    return []
+if not IN_FILE.exists():
+    print("ERROR: no encuentro", IN_FILE)
+    raise SystemExit(1)
 
-def load_title_actor_pairs():
-    if not os.path.exists(TITLE_ACTORS_RAW_CSV):
-        return []
-    df = pd.read_csv(TITLE_ACTORS_RAW_CSV, dtype=str, keep_default_na=False)
-    # intentar detectar columnas show_id, actor_name
-    cols = [c.lower().strip() for c in df.columns]
-    if 'show_id' in cols and 'actor_name' in cols:
-        # map original column names
-        show_col = df.columns[cols.index('show_id')]
-        actor_col = df.columns[cols.index('actor_name')]
-        pairs = [(str(row[show_col]).strip(), str(row[actor_col]).strip()) for _, row in df.iterrows()]
-    else:
-        # asumir orden show_id, actor_name
-        pairs = [(str(row[0]).strip(), str(row[1]).strip()) for _, row in df.iterrows()]
-    # filtrar vacíos
-    pairs = [(s,a) for s,a in pairs if s and a]
-    return pairs
+seen = set()
+out_lines = []
+actor_insert_re = re.compile(r"INSERT\s+INTO\s+actors\s*\([^\)]*\)\s*VALUES\s*\((.+)\)\s*;", re.IGNORECASE)
 
-def sql_escape(s):
-    if s is None:
-        return "NULL"
-    s = str(s)
-    # reemplazar comilla simple por dos comillas simples para SQL
-    return "'" + s.replace("'", "''") + "'"
+def parse_actor_name_from_values(values_text):
+    # values_text typical: 294, 'Adam Devine'
+    # We want the last quoted string (actor_name). Handle escaped quotes by doubling ('')
+    # Simple approach: find first ' then last ' and extract between, but handle doubled quotes.
+    # We'll search for the last single-quoted literal.
+    matches = re.findall(r"'((?:[^']|'')+)'", values_text)
+    if not matches:
+        return None
+    # last match is actor_name
+    name = matches[-1]
+    # unescape doubled single-quotes to single
+    name = name.replace("''", "'")
+    return name
 
-def main():
-    print("Cargando actores...")
-    actors = load_actors()
-    pairs = load_title_actor_pairs()
-    if not actors and not pairs:
-        print("No se encontraron actors.csv ni title_actors_raw.csv en", DATA_DIR)
-        return
-
-    # si no teníamos actors list, construimos a partir de pairs
-    if not actors:
-        actors = sorted({a for _, a in pairs})
-
-    # asignar actor_id secuencial
-    actor_to_id = {name: idx+1 for idx, name in enumerate(actors)}
-
-    print(f"Actores detectados: {len(actors)}")
-    print(f"Pares show-actor detectados: {len(pairs)}")
-
-    # escribir archivo SQL
-    with open(OUT_SQL, "w", encoding="utf-8") as f:
-        f.write("-- inserts_actors.sql\n")
-        f.write("-- Generated by etl/generate_actor_inserts.py\n\n")
-        # INSERTs para actors (actor_id, actor_name)
-        f.write("-- actors\n")
-        for name, aid in actor_to_id.items():
-            f.write(f"INSERT INTO actors (actor_id, actor_name) VALUES ({aid}, {sql_escape(name)});\n")
-        f.write("\n")
-        # INSERTs para title_actors
-        f.write("-- title_actors\n")
-        for show_id, actor_name in pairs:
-            # si actor_name no está en dict (por diferencia de trimming), intentamos buscarlo
-            aid = actor_to_id.get(actor_name)
-            if aid is None:
-                # buscar case-insensitive or normalized
-                key = next((actor_to_id[k] for k in actor_to_id if k.lower() == actor_name.lower()), None)
-                if key is not None:
-                    aid = key
+with IN_FILE.open("r", encoding="utf-8", errors="replace") as f:
+    for line in f:
+        m = actor_insert_re.search(line)
+        if m:
+            vals = m.group(1)
+            actor_name = parse_actor_name_from_values(vals)
+            if not actor_name:
+                # no parse -> keep original line to be safe
+                out_lines.append(line)
+            else:
+                if actor_name not in seen:
+                    seen.add(actor_name)
+                    # write normalized INSERT IGNORE with only actor_name so MySQL assigns id
+                    safe = actor_name.replace("'", "''")
+                    out_lines.append(f"INSERT IGNORE INTO actors (actor_name) VALUES ('{safe}');\n")
                 else:
-                    # si aun no se encuentra, añadir dinámicamente (rare)
-                    aid = max(actor_to_id.values(), default=0) + 1
-                    actor_to_id[actor_name] = aid
-                    # también escribir su INSERT al inicio (pero aquí ya estamos en medio) -> escribir ahora
-                    f.write(f"INSERT INTO actors (actor_id, actor_name) VALUES ({aid}, {sql_escape(actor_name)});\n")
-            f.write(f"INSERT INTO title_actors (show_id, actor_id) VALUES ({sql_escape(show_id)}, {aid});\n")
+                    # skip duplicate actor insert
+                    pass
+        else:
+            out_lines.append(line)
 
-    print("Generado:", OUT_SQL)
+OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+with OUT_FILE.open("w", encoding="utf-8") as f:
+    f.writelines(out_lines)
 
-if __name__ == "__main__":
-    main()
+print(f"Hecho. Actores únicos escritos: {len(seen)}")
+print("Archivo generado:", OUT_FILE)
