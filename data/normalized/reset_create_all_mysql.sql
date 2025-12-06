@@ -1,84 +1,102 @@
--- sql/reset_create_all_mysql.sql
-DROP DATABASE IF EXISTS netflix_db;
-CREATE DATABASE netflix_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE netflix_db;
+-- reset_create_all_mysql.sql
+-- Crea la BD netflix_db y todas las tablas necesarias con relaciones e índices.
+-- Incluye tanto `cast` como `cast_list` en netflix_titles para compatibilidad
+-- UTF8MB4 / InnoDB por defecto.
 
-CREATE TABLE IF NOT EXISTS netflix_titles (
-  show_id VARCHAR(64) NOT NULL PRIMARY KEY,
-  type VARCHAR(50),
-  title TEXT,
-  director TEXT,
-  cast TEXT,
-  country VARCHAR(255),
-  date_added DATE,
-  release_year INT,
-  rating VARCHAR(20),
-  duration_raw VARCHAR(50),
-  duration_int INT,
-  duration_unit VARCHAR(20),
-  description TEXT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+DROP DATABASE IF EXISTS `netflix_db`;
+CREATE DATABASE `netflix_db` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+USE `netflix_db`;
 
-CREATE TABLE IF NOT EXISTS genres (
-  genre_id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  genre_name VARCHAR(150) NOT NULL UNIQUE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+SET FOREIGN_KEY_CHECKS = 0;
 
-CREATE TABLE IF NOT EXISTS title_genres (
-  show_id VARCHAR(64) NOT NULL,
-  genre_id INT NOT NULL,
-  PRIMARY KEY (show_id, genre_id),
-  CONSTRAINT fk_tg_show FOREIGN KEY (show_id) REFERENCES netflix_titles(show_id) ON DELETE CASCADE ON UPDATE CASCADE,
-  CONSTRAINT fk_tg_genre FOREIGN KEY (genre_id) REFERENCES genres(genre_id) ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+---------------------------------------------------------------------
+-- Tabla principal: netflix_titles
+---------------------------------------------------------------------
+DROP TABLE IF EXISTS `netflix_titles`;
+CREATE TABLE `netflix_titles` (
+  `show_id` VARCHAR(128) NOT NULL,
+  `type` VARCHAR(50),
+  `title` VARCHAR(1000),
+  `director` VARCHAR(500),
+  `cast` TEXT,        -- columna con nombre "cast" (para compatibilidad)
+  `cast_list` TEXT,   -- columna alternativa "cast_list" (recomendada)
+  `country` VARCHAR(300),
+  `date_added` DATE,
+  `release_year` INT,
+  `rating` VARCHAR(50),
+  `duration_raw` VARCHAR(100),
+  `duration_int` INT,
+  `duration_unit` VARCHAR(50),
+  `description` TEXT,
+  PRIMARY KEY (`show_id`),
+  KEY `ix_titles_type` (`type`(20)),
+  KEY `ix_titles_release_year` (`release_year`),
+  FULLTEXT KEY `ft_title_description` (`title`, `description`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
-CREATE TABLE IF NOT EXISTS actors (
-  actor_id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  actor_name VARCHAR(255) NOT NULL,
-  UNIQUE KEY ux_actor_name (actor_name)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+---------------------------------------------------------------------
+-- Tabla: genres
+---------------------------------------------------------------------
+DROP TABLE IF EXISTS `genres`;
+CREATE TABLE `genres` (
+  `genre_id` INT NOT NULL AUTO_INCREMENT,
+  `genre_name` VARCHAR(255) NOT NULL,
+  PRIMARY KEY (`genre_id`),
+  UNIQUE KEY `ux_genre_name` (`genre_name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
-CREATE TABLE IF NOT EXISTS title_actors (
-  show_id VARCHAR(64) NOT NULL,
-  actor_id INT NOT NULL,
-  PRIMARY KEY (show_id, actor_id),
-  CONSTRAINT fk_ta_show FOREIGN KEY (show_id) REFERENCES netflix_titles(show_id) ON DELETE CASCADE ON UPDATE CASCADE,
-  CONSTRAINT fk_ta_actor FOREIGN KEY (actor_id) REFERENCES actors(actor_id) ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+---------------------------------------------------------------------
+-- Tabla relación: title_genres (N:N)
+---------------------------------------------------------------------
+DROP TABLE IF EXISTS `title_genres`;
+CREATE TABLE `title_genres` (
+  `id` INT NOT NULL AUTO_INCREMENT,
+  `show_id` VARCHAR(128) NOT NULL,
+  `genre_id` INT NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `ix_tg_show` (`show_id`),
+  KEY `ix_tg_genre` (`genre_id`),
+  CONSTRAINT `fk_tg_show` FOREIGN KEY (`show_id`) REFERENCES `netflix_titles`(`show_id`) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT `fk_tg_genre` FOREIGN KEY (`genre_id`) REFERENCES `genres`(`genre_id`) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
-CREATE TABLE IF NOT EXISTS imdb_movies (
-  imdb_id VARCHAR(64) NOT NULL PRIMARY KEY,
-  title VARCHAR(255),
-  original_title VARCHAR(255),
-  year INT,
-  imdb_rating DECIMAL(3,1),
-  imdb_votes INT,
-  runtime INT,
-  genres TEXT,
-  directors TEXT,
-  countries TEXT
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+---------------------------------------------------------------------
+-- Tabla: actors
+---------------------------------------------------------------------
+DROP TABLE IF EXISTS `actors`;
+CREATE TABLE `actors` (
+  `actor_id` INT NOT NULL AUTO_INCREMENT,
+  `actor_name` VARCHAR(400) NOT NULL,
+  PRIMARY KEY (`actor_id`),
+  UNIQUE KEY `ux_actor_name` (`actor_name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
-CREATE TABLE IF NOT EXISTS netflix_imdb_map (
-  show_id VARCHAR(64) NOT NULL,
-  imdb_id VARCHAR(64) NOT NULL,
-  match_score TINYINT UNSIGNED,
-  PRIMARY KEY (show_id, imdb_id),
-  CONSTRAINT fk_map_show FOREIGN KEY (show_id) REFERENCES netflix_titles(show_id) ON DELETE CASCADE ON UPDATE CASCADE,
-  CONSTRAINT fk_map_imdb FOREIGN KEY (imdb_id) REFERENCES imdb_movies(imdb_id) ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+---------------------------------------------------------------------
+-- Tabla relación: title_actors (N:N)
+---------------------------------------------------------------------
+DROP TABLE IF EXISTS `title_actors`;
+CREATE TABLE `title_actors` (
+  `id` INT NOT NULL AUTO_INCREMENT,
+  `show_id` VARCHAR(128) NOT NULL,
+  `actor_id` INT NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `ix_ta_show` (`show_id`),
+  KEY `ix_ta_actor` (`actor_id`),
+  CONSTRAINT `fk_ta_show` FOREIGN KEY (`show_id`) REFERENCES `netflix_titles`(`show_id`) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT `fk_ta_actor` FOREIGN KEY (`actor_id`) REFERENCES `actors`(`actor_id`) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
--- staging raw tables
-CREATE TABLE IF NOT EXISTS title_actors_raw (
-  show_id VARCHAR(64),
-  actor_name VARCHAR(255)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+---------------------------------------------------------------------
+-- (Opcional) Tabla staging para cargas masivas (si la quieres)
+---------------------------------------------------------------------
+DROP TABLE IF EXISTS `staging_netflix_titles`;
+CREATE TABLE `staging_netflix_titles` (
+  `show_id` VARCHAR(128),
+  `raw_json` LONGTEXT,
+  `loaded_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
-CREATE TABLE IF NOT EXISTS title_genres_raw (
-  show_id VARCHAR(64),
-  genre_name VARCHAR(150)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- helpful indexes
-CREATE INDEX idx_netflix_release_year ON netflix_titles(release_year);
-CREATE INDEX idx_netflix_country ON netflix_titles(country);
+---------------------------------------------------------------------
+-- Final
+---------------------------------------------------------------------
+SET FOREIGN_KEY_CHECKS = 1;

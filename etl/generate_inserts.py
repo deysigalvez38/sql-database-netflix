@@ -1,186 +1,356 @@
+#!/usr/bin/env python3
+# etl/generate_all_inserts.py
 """
-generate_inserts.py — versión estable para MySQL
+Genera data/normalized/inserts.sql con las 5 tablas rellenas:
+ - netflix_titles
+ - genres
+ - title_genres
+ - actors
+ - title_actors
+
+Lee (preferencia):
+ - data/normalized/netflix_titles_clean.csv
+ - data/normalized/title_actors_raw.csv  (opcional, si existe)
+ - data/normalized/genres.csv            (opcional)
+ - data/normalized/title_genres.csv     (opcional)
+
+También escribe archivos de debug:
+ - data/normalized/actors_extracted.csv
+ - data/normalized/title_genres_extracted.csv
 """
 
-import os
-import csv
-import re
+from pathlib import Path
 import pandas as pd
-from rapidfuzz import process, fuzz
+import re
+from collections import defaultdict, Counter
+from unidecode import unidecode
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-OUT_DIR = os.path.join(DATA_DIR, "normalized")
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "data"
+NORMAL = DATA / "normalized"
+NORMAL.mkdir(parents=True, exist_ok=True)
 
-os.makedirs(OUT_DIR, exist_ok=True)
+CSV_TITLES_PRIMARY = NORMAL / "netflix_titles_clean.csv"
+CSV_TITLES_FALLBACK = DATA / "netflix_titles.csv"
+CSV_TITLE_ACTORS_RAW = NORMAL / "title_actors_raw.csv"
+CSV_GENRES = NORMAL / "genres.csv"
+CSV_TITLE_GENRES = NORMAL / "title_genres.csv"
 
-INPUT_CSV = os.path.join(DATA_DIR, "netflix_titles.csv")
-OUT_NETFLIX_CSV = os.path.join(OUT_DIR, "netflix_titles_clean.csv")
-OUT_GENRES_CSV = os.path.join(OUT_DIR, "genres.csv")
-OUT_TITLE_GENRES_CSV = os.path.join(OUT_DIR, "title_genres.csv")
-OUT_INSERTS_SQL = os.path.join(OUT_DIR, "inserts.sql")
+OUT_SQL = NORMAL / "inserts.sql"
+ACTORS_CSV = NORMAL / "actors_extracted.csv"
+TG_CSV = NORMAL / "title_genres_extracted.csv"
 
+ENCODINGS = ["utf-8", "latin-1", "cp1252"]
 
-def snake_case_cols(df):
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-    return df
+def read_csv_try(path):
+    if not path.exists():
+        return None, f"missing {path.name}"
+    last_err = None
+    for enc in ENCODINGS:
+        try:
+            df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding=enc)
+            return df, f"ok ({enc}, rows={len(df)})"
+        except Exception as e:
+            last_err = e
+    return None, f"error reading {path}: {last_err}"
 
+def sql_escape(v):
+    if v is None: return "NULL"
+    s = str(v).strip()
+    if s == "": return "NULL"
+    s = s.replace("\r"," ").replace("\n"," ")
+    s = s.replace("'", "''")
+    return f"'{s}'"
 
-def parse_duration(duration):
-    if pd.isna(duration):
-        return (None, None)
+def normalize_key(s):
+    if not s: return ""
+    s = unidecode(str(s)).lower()
+    s = " ".join(s.split())
+    s = re.sub(r"[^a-z0-9 ]+","", s)
+    return s
 
-    s = str(duration).strip()
-    parts = s.split()
+def split_actors_field(raw):
+    if not raw: return []
+    s = str(raw).strip()
+    if s == "": return []
+    # common separators -> comma
+    s = re.sub(r"\s*\|\s*", ",", s)
+    s = re.sub(r"\s*;\s*", ",", s)
+    s = re.sub(r"\s+and\s+", ",", s, flags=re.IGNORECASE)
+    # remove surrounding brackets and quotes but preserve inner commas
+    s = s.strip()
+    parts = [p.strip() for p in re.split(r",", s) if p.strip()]
+    cleaned = []
+    for p in parts:
+        p = re.sub(r"^[\[\(\{\"\']+","", p)
+        p = re.sub(r"[\]\)\}\"']+$","", p)
+        p = re.sub(r"\s*-\s*.*$","", p).strip()
+        p = re.sub(r"\s*\(.*\)$","", p).strip()
+        if p:
+            cleaned.append(p)
+    return cleaned
 
-    try:
-        num = int(parts[0])
-    except:
-        m = re.search(r"(\d+)", s)
-        num = int(m.group(1)) if m else None
-
-    unit = parts[1] if len(parts) > 1 else None
-    return (num, unit)
-
-
-def split_genres(s):
-    if pd.isna(s):
-        return []
-    return [g.strip() for g in str(s).split(",") if g.strip()]
-
-
-def fuzzy_dedup_genres(raw_genres_list, score_cutoff=90):
-    unique_raw = sorted(set(raw_genres_list))
-    canonical = []
-    mapping = {}
-
-    for raw in unique_raw:
-        if canonical:
-            match, score, _ = process.extractOne(raw, canonical, scorer=fuzz.WRatio)
-            if score >= score_cutoff:
-                mapping[raw] = match
-                continue
-
-        canonical.append(raw)
-        mapping[raw] = raw
-
-    return mapping, canonical
-
-
-def escape(value):
-    """Escapa comillas simples para MySQL"""
-    if value is None or pd.isna(value):
-        return "NULL"
-    value = str(value)
-    return "'" + value.replace("'", "''") + "'"
-
-
-def main():
-    print("Leyendo:", INPUT_CSV)
-
-    if not os.path.exists(INPUT_CSV):
-        print("ERROR: No se encontró netflix_titles.csv")
-        return
-
-    df = pd.read_csv(INPUT_CSV)
-    df = snake_case_cols(df)
-
-    if "show_id" not in df.columns:
-        df.insert(0, "show_id", [f"S{i:06d}" for i in range(1, len(df) + 1)])
+# ----------------- Read inputs -----------------
+df_titles, info_titles = read_csv_try(CSV_TITLES_PRIMARY)
+if df_titles is None:
+    df_titles, info_titles_fb = read_csv_try(CSV_TITLES_FALLBACK)
+    if df_titles is not None:
+        info_titles = f"fallback {CSV_TITLES_FALLBACK.name} -> {info_titles_fb}"
     else:
-        df["show_id"] = df["show_id"].astype(str)
+        info_titles = info_titles + f" // fallback {info_titles_fb}"
 
-    if "date_added" in df.columns:
-        df["date_added"] = pd.to_datetime(df["date_added"], errors="coerce")
+df_ta_raw, info_ta_raw = read_csv_try(CSV_TITLE_ACTORS_RAW)
+df_genres, info_genres = read_csv_try(CSV_GENRES)
+df_tg, info_tg = read_csv_try(CSV_TITLE_GENRES)
 
-    if "duration" in df.columns:
-        parsed = df["duration"].apply(parse_duration)
-        df["duration_int"] = parsed.apply(lambda t: t[0])
-        df["duration_unit"] = parsed.apply(lambda t: t[1])
+print("INPUTS:", info_titles, info_ta_raw, info_genres, info_tg)
 
-    for c in ["director", "cast", "country", "rating", "listed_in", "description"]:
-        if c in df.columns:
-            df[c] = df[c].fillna("Unknown")
+# ----------------- Prepare output header -----------------
+lines = []
+lines.append("-- inserts.sql generated by etl/generate_all_inserts.py")
+lines.append(f"-- DIAGNOSIS: titles={info_titles}; title_actors_raw={info_ta_raw}; genres={info_genres}; title_genres={info_tg}")
+lines.append("SET NAMES utf8mb4;")
+lines.append("SET FOREIGN_KEY_CHECKS = 0;")
+lines.append("START TRANSACTION;")
+lines.append("")
 
-    df["__genres_list"] = df["listed_in"].apply(split_genres)
-    all_raw_genres = []
-    df["__genres_list"].apply(lambda L: all_raw_genres.extend(L))
+# ---------- netflix_titles ----------
+def detect_show_id_col(df):
+    if df is None: return None
+    for c in df.columns:
+        if c.lower() in ("show_id","showid","id"):
+            return c
+    for c in df.columns:
+        if "show" in c.lower() and "id" in c.lower(): return c
+    return None
 
-    mapping, canonical_genres = fuzzy_dedup_genres(all_raw_genres)
+sid_col = detect_show_id_col(df_titles)
+titles_created = 0
+lines.append("-- netflix_titles")
+if df_titles is None:
+    lines.append("-- SKIPPED: titles CSV not found")
+else:
+    if sid_col is None:
+        lines.append("-- ERROR: no show_id column detected in titles. Columns: " + ", ".join(df_titles.columns))
+    else:
+        for _, r in df_titles.iterrows():
+            sid = str(r.get(sid_col,"")).strip()
+            if not sid: continue
+            def gv(*cands):
+                for c in cands:
+                    if c in df_titles.columns and str(r.get(c,"")).strip():
+                        return r.get(c)
+                return ""
+            type_ = gv("type","Type")
+            title = gv("title","name")
+            director = gv("director","Director")
+            # detect cast-like column
+            cast_val = ""
+            for c in df_titles.columns:
+                if "cast" in c.lower() or "actor" in c.lower() or "starring" in c.lower():
+                    v = str(r.get(c,"") or "").strip()
+                    if v:
+                        cast_val = v
+                        break
+            country = gv("country","Country")
+            date_added = gv("date_added","dateAdded")
+            release_year = gv("release_year","releaseYear")
+            rating = gv("rating")
+            duration_raw = gv("duration_raw","duration")
+            description = gv("description","synopsis","summary")
+            vals = ",".join([
+                sql_escape(sid),
+                sql_escape(type_),
+                sql_escape(title),
+                sql_escape(director),
+                sql_escape(cast_val),
+                sql_escape(country),
+                (sql_escape(date_added) if date_added else "NULL"),
+                (str(int(release_year)) if str(release_year).isdigit() else (sql_escape(release_year) if release_year else "NULL")),
+                sql_escape(rating),
+                sql_escape(duration_raw),
+                "NULL", # duration_int (optional)
+                "NULL", # duration_unit
+                sql_escape(description)
+            ])
+            cols = ",".join([f"`{c}`" for c in ["show_id","type","title","director","cast","country","date_added","release_year","rating","duration_raw","duration_int","duration_unit","description"]])
+            # note: schema's cast column name may be `cast` or `cast_list` — adapt if necessary
+            lines.append(f"INSERT IGNORE INTO netflix_titles ({cols}) VALUES ({vals});")
+            titles_created += 1
+        lines.append(f"-- FILAS netflix_titles generadas: {titles_created}")
+lines.append("")
 
-    genres_df = (
-        pd.DataFrame({"genre_name": sorted(set(mapping[g] for g in mapping))})
-        .reset_index(drop=True)
-    )
-    genres_df.insert(0, "genre_id", range(1, len(genres_df) + 1))
+# ---------- genres + title_genres ----------
+lines.append("-- genres + title_genres")
+genre_set = set()
+genre_pairs = []   # (sid, genre)
+if df_tg is not None:
+    # prefer title_genres.csv pairs
+    sidc = None
+    gcol = None
+    for c in df_tg.columns:
+        if c.lower() in ("show_id","showid","id"): sidc = c
+        if "genre" in c.lower() or "listed" in c.lower() or "name" in c.lower(): gcol = c
+    if sidc is None:
+        print("title_genres.csv present but no show_id column detected.")
+    else:
+        for _, r in df_tg.iterrows():
+            sid = str(r.get(sidc,"")).strip()
+            if not sid: continue
+            if gcol:
+                gval = str(r.get(gcol,"")).strip()
+                if not gval: continue
+                for g in [p.strip() for p in re.split(r",|;|\|", gval) if p.strip()]:
+                    genre_set.add(g); genre_pairs.append((sid, g))
+elif df_genres is not None:
+    # populate from genres.csv
+    gcol = next((c for c in df_genres.columns if c.lower() in ("genre_name","genre","name")), df_genres.columns[0])
+    for _, r in df_genres.iterrows():
+        g = str(r.get(gcol,"")).strip()
+        if g: genre_set.add(g)
+    # try to extract relations from titles listed_in
+    if df_titles is not None:
+        list_col = next((c for c in df_titles.columns if "listed" in c.lower() or "genre" in c.lower()), None)
+        if list_col:
+            for _, r in df_titles.iterrows():
+                sid = str(r.get(sid_col,"")).strip()
+                if not sid: continue
+                tgs = str(r.get(list_col,"")).strip()
+                if not tgs: continue
+                for g in [p.strip() for p in re.split(r",|;|\|", tgs) if p.strip()]:
+                    genre_set.add(g); genre_pairs.append((sid,g))
+else:
+    # fallback: extract from title listed_in
+    if df_titles is not None:
+        list_col = next((c for c in df_titles.columns if "listed" in c.lower() or "genre" in c.lower()), None)
+        if list_col:
+            for _, r in df_titles.iterrows():
+                sid = str(r.get(sid_col,"")).strip()
+                if not sid: continue
+                tgs = str(r.get(list_col,"")).strip()
+                if not tgs: continue
+                for g in [p.strip() for p in re.split(r",|;|\|", tgs) if p.strip()]:
+                    genre_set.add(g); genre_pairs.append((sid,g))
 
-    title_genres_rows = []
-    for _, row in df.iterrows():
-        sid = row["show_id"]
-        for raw_g in row["__genres_list"]:
-            canonical = mapping.get(raw_g, raw_g)
-            gid = genres_df[genres_df["genre_name"] == canonical]["genre_id"].values
-            if len(gid) > 0:
-                title_genres_rows.append({"show_id": sid, "genre_id": int(gid[0])})
+# write genres inserts
+gcnt = 0; tgc = 0
+if genre_set:
+    for g in sorted(genre_set):
+        lines.append(f"INSERT IGNORE INTO genres (`genre_name`) VALUES ({sql_escape(g)});")
+        gcnt += 1
+    if genre_pairs:
+        for sid,g in genre_pairs:
+            lines.append(f"INSERT IGNORE INTO title_genres (`show_id`, `genre_id`) SELECT {sql_escape(sid)}, `genre_id` FROM genres WHERE `genre_name` = {sql_escape(g)};")
+            tgc += 1
+lines.append(f"-- FILAS genres: {gcnt}; title_genres: {tgc}")
+lines.append("")
 
-    title_genres_df = pd.DataFrame(title_genres_rows)
+# ---------- actors + title_actors ----------
+lines.append("-- actors + title_actors")
+pairs = []   # (sid, actor_name)
 
-    netflix_clean_cols = [
-        "show_id", "type", "title", "director", "cast", "country",
-        "date_added", "release_year", "rating", "duration",
-        "duration_int", "duration_unit", "description",
-    ]
+# priority: title_actors_raw.csv if present
+if df_ta_raw is not None:
+    # expect columns [show_id, actor_name] or similar
+    sidc = next((c for c in df_ta_raw.columns if c.lower() in ("show_id","showid","id")), None)
+    actorc = next((c for c in df_ta_raw.columns if "actor" in c.lower() or "name" in c.lower()), None)
+    if sidc is None:
+        print("title_actors_raw.csv present but no show_id column detected.")
+    else:
+        if actorc:
+            for _, r in df_ta_raw.iterrows():
+                sid = str(r.get(sidc,"")).strip()
+                if not sid: continue
+                raw = str(r.get(actorc,"")).strip()
+                if not raw: continue
+                # raw may contain comma-separated list -> split
+                for a in re.split(r",|;|\||\sand\s", raw):
+                    a = a.strip()
+                    if a:
+                        # clean
+                        a = re.sub(r"^[\[\(\{\"\']+","", a)
+                        a = re.sub(r"[\]\)\}\"']+$","", a)
+                        a = re.sub(r"\s*\(.*\)$","", a).strip()
+                        pairs.append((sid, a))
+        else:
+            # try using second column as actor
+            cols = [c for c in df_ta_raw.columns if c != sidc]
+            if cols:
+                for _, r in df_ta_raw.iterrows():
+                    sid = str(r.get(sidc,"")).strip()
+                    if not sid: continue
+                    raw = str(r.get(cols[0],"")).strip()
+                    if not raw: continue
+                    for a in re.split(r",|;|\||\sand\s", raw):
+                        a = a.strip()
+                        if a:
+                            a = re.sub(r"^[\[\(\{\"\']+","", a)
+                            a = re.sub(r"[\]\)\}\"']+$","", a)
+                            a = re.sub(r"\s*\(.*\)$","", a).strip()
+                            pairs.append((sid, a))
 
-    df_out = df[netflix_clean_cols]
-    df_out.to_csv(OUT_NETFLIX_CSV, index=False)
-    genres_df.to_csv(OUT_GENRES_CSV, index=False)
-    title_genres_df.to_csv(OUT_TITLE_GENRES_CSV, index=False)
+# fallback: extract from df_titles cast column
+if not pairs and df_titles is not None:
+    cast_col = next((c for c in df_titles.columns if "cast" in c.lower() or "actor" in c.lower() or "starring" in c.lower()), None)
+    if cast_col:
+        for _, r in df_titles.iterrows():
+            sid = str(r.get(sid_col,"")).strip()
+            if not sid: continue
+            raw = str(r.get(cast_col,"")).strip()
+            if not raw: continue
+            for a in split_actors_field(raw):
+                pairs.append((sid, a))
+    else:
+        print("No cast column found in titles and no title_actors_raw.csv provided.")
 
-    print("Generando inserts.sql...")
+# canonicalize actors and generate inserts
+# canonicalization: normalize accents/case and pick most frequent representation
+groups = defaultdict(list)
+for sid,a in pairs:
+    k = normalize_key(a)
+    groups[k].append(a)
+canonical = {}
+for k,names in groups.items():
+    cnt = Counter(names)
+    canonical[k] = sorted(cnt.items(), key=lambda x:(-x[1], len(x[0]), x[0]))[0][0]
+orig_to_canon = {}
+for k,names in groups.items():
+    for n in set(names):
+        orig_to_canon[n] = canonical[k]
 
-    with open(OUT_INSERTS_SQL, "w", encoding="utf-8") as f:
+unique_actors = sorted(set(canonical.values()))
+for a in unique_actors:
+    lines.append(f"INSERT IGNORE INTO actors (`actor_name`) VALUES ({sql_escape(a)});")
+# title_actors mapping using SELECT to match actor_id
+seen = set()
+for sid,a in pairs:
+    canon = orig_to_canon.get(a, a)
+    key = (sid, canon)
+    if key in seen: continue
+    seen.add(key)
+    lines.append(f"INSERT IGNORE INTO title_actors (`show_id`, `actor_id`) SELECT {sql_escape(sid)}, `actor_id` FROM actors WHERE `actor_name` = {sql_escape(canon)};")
 
-        # netflix_titles
-        for _, r in df_out.iterrows():
-            date_added = (
-                f"'{r['date_added'].date()}'" if not pd.isna(r["date_added"]) else "NULL"
-            )
+lines.append(f"-- FILAS actors: {len(unique_actors)}; title_actors (approx): {len(seen)}")
+lines.append("")
+lines.append("COMMIT;")
+lines.append("SET FOREIGN_KEY_CHECKS = 1;")
+lines.append("")
 
-            query = (
-                "INSERT INTO netflix_titles VALUES ("
-                f"{escape(r['show_id'])}, "
-                f"{escape(r['type'])}, "
-                f"{escape(r['title'])}, "
-                f"{escape(r['director'])}, "
-                f"{escape(r['cast'])}, "
-                f"{escape(r['country'])}, "
-                f"{date_added}, "
-                f"{r['release_year'] if not pd.isna(r['release_year']) else 'NULL'}, "
-                f"{escape(r['rating'])}, "
-                f"{escape(r['duration'])}, "
-                f"{r['duration_int'] if not pd.isna(r['duration_int']) else 'NULL'}, "
-                f"{escape(r['duration_unit'])}, "
-                f"{escape(r['description'])}"
-                ");\n"
-            )
-            f.write(query)
+# write output SQL
+with open(OUT_SQL, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines))
 
-        # genres
-        for _, r in genres_df.iterrows():
-            f.write(
-                f"INSERT INTO genres (genre_id, genre_name) VALUES "
-                f"({r['genre_id']}, {escape(r['genre_name'])});\n"
-            )
+# write debug CSVs
+if pairs:
+    df_actors = pd.DataFrame(pairs, columns=["show_id","actor_name"])
+    df_actors.to_csv(ACTORS_CSV, index=False, encoding="utf-8")
+if genre_pairs:
+    df_tg_out = pd.DataFrame(genre_pairs, columns=["show_id","genre_name"])
+    df_tg_out.to_csv(TG_CSV, index=False, encoding="utf-8")
 
-        # title_genres
-        for _, r in title_genres_df.iterrows():
-            f.write(
-                f"INSERT INTO title_genres (show_id, genre_id) VALUES "
-                f"({escape(r['show_id'])}, {r['genre_id']});\n"
-            )
-
-    print("¡Listo! inserts.sql generado en:", OUT_INSERTS_SQL)
-
-
-if __name__ == "__main__":
-    main()
+print("Generated:", OUT_SQL)
+if pairs:
+    print("Actors extracted file:", ACTORS_CSV)
+if genre_pairs:
+    print("Title-genre pairs file:", TG_CSV)
+print("If actors are still missing in the final INSERT run, inspect actors_extracted.csv and title_actors raw to verify parsing.")
